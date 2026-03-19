@@ -1,0 +1,12 @@
+{
+  "image":    "kitchen1.png",
+  "mask":     "kitchen1_mask.png",
+  "depth":    "kitchen1_depth.png",
+  "output":   "output.mp4",
+  "duration": 30,
+  "fps":      25,
+  "pests": [
+    {"type": "mouse",     "count": 1, "size": 50, "speed": 6},
+    {"type": "cockroach", "count": 2, "size": 30, "speed": 9}
+  ]
+}
