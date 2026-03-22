@@ -472,3 +472,8 @@ For each frame and each pest:
 5. The **track ID** is a stable integer assigned at pest creation time, unchanged across all frames
 
 Annotations are ground-truth accurate — no labelling error, no occlusion ambiguity, no annotation noise.
+
+## TODO
+
+1. add feature that allows pests to disappear below counter tops
+2. add pest spawning on flat surfaces other than the floor
