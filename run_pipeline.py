@@ -85,7 +85,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Full pest video generation pipeline.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--image",         required=True)
+    parser.add_argument("--image",         default=None,
+                        help="Kitchen image path. If --config is provided, read from config.")
     parser.add_argument("--output_dir",    default="pipeline_out")
     parser.add_argument("--n",             type=int, default=10)
     parser.add_argument("--config",        default=None,
@@ -112,13 +113,31 @@ def main():
                         help="Skip frame extraction and dataset assembly")
     args = parser.parse_args()
 
-    # ── Validate image ───────────────────────────────────────────────
+    # ── Resolve image ────────────────────────────────────────────────
+    # If --image not given but --config is, read image path from the config
+    if args.image is None:
+        if args.config is None:
+            print("[ERROR] Provide --image, or --config containing an 'image' field")
+            sys.exit(1)
+        try:
+            with open(args.config) as f:
+                _cfg_peek = json.load(f)
+            args.image = _cfg_peek.get("image")
+            if not args.image:
+                print("[ERROR] Config has no 'image' field and --image was not provided")
+                sys.exit(1)
+            print(f"[INFO] Image read from config: {args.image}")
+        except Exception as e:
+            print(f"[ERROR] Could not read config: {e}")
+            sys.exit(1)
+
     if not os.path.exists(args.image):
         print(f"[ERROR] Image not found: {args.image}")
         sys.exit(1)
 
     image_stem = Path(args.image).stem
-    out        = args.output_dir
+    # Scope everything under out/<image_stem>/ so multiple images never collide
+    out        = os.path.join(args.output_dir, image_stem)
     os.makedirs(out, exist_ok=True)
 
     depth_path   = os.path.join(out, f"{image_stem}_depth.png")
@@ -181,9 +200,13 @@ def main():
         if depth_path and os.path.exists(depth_path):
             cfg["depth"] = depth_path
         if "output" not in cfg:
-            cfg["output"] = os.path.join(video_dir, "output_0000.mp4")
+            cfg["output"] = os.path.join(video_dir, f"{image_stem}_output.mp4")
         else:
-            cfg["output"] = os.path.join(video_dir, os.path.basename(cfg["output"]))
+            # Prefix with image_stem to avoid collisions across images
+            base = os.path.basename(cfg["output"])
+            if not base.startswith(image_stem):
+                base = f"{image_stem}_{base}"
+            cfg["output"] = os.path.join(video_dir, base)
 
         patched = os.path.join(out, "_single_config.json")
         with open(patched, "w") as f:
@@ -235,7 +258,7 @@ def main():
             "--cockroaches", str(args.cockroaches[0]), str(args.cockroaches[1]),
             "--duration",    str(args.duration[0]),    str(args.duration[1]),
             "--fps",         str(args.fps),
-            "--output_prefix", "video",
+            "--output_prefix", f"{image_stem}_video",
         ]
         if os.path.exists(mask_path):
             cfg_cmd += ["--mask", mask_path]
