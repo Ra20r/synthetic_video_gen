@@ -1,36 +1,45 @@
 """
 run_pipeline.py
 ===============
-All-in-one pipeline: depth map → floor mask → generate configs → render videos.
+All-in-one pipeline:
+  depth map → floor mask → configs → render videos + COCO annotations → extract frames → dataset
 
 Usage:
-    # Generate 20 random videos:
+    # Generate 20 random videos + full COCO dataset:
     python run_pipeline.py --image kitchen1.png --n 20 --output_dir out/
 
-    # Use a single hand-crafted config instead of random generation:
+    # Use a single hand-crafted config:
     python run_pipeline.py --image kitchen1.png --config my_config.json --output_dir out/
 
-    # Skip steps you've already run:
+    # Skip steps already done:
     python run_pipeline.py --image kitchen1.png --n 10 --output_dir out/ \
                            --skip_depth --skip_mask
 
+    # Skip frame extraction (videos only, no dataset):
+    python run_pipeline.py --image kitchen1.png --n 10 --output_dir out/ \
+                           --skip_extract
+
 Full arguments:
-    --image         Kitchen image path (required)
-    --output_dir    Root output directory (default: pipeline_out/)
-    --n             Number of random configs/videos to generate (default: 10)
-    --config        Path to a single config JSON — skips random generation
-    --mice          Min max mice range (default: 0 3)
-    --cockroaches   Min max cockroach range (default: 0 5)
-    --duration      Video duration range seconds (default: 15 30)
-    --fps           Frames per second (default: 25)
-    --jobs          Parallel render jobs (default: 1)
-    --floor_labels  ADE20K floor label indices (default: 3)
-    --depth_thresh  Depth threshold 0-255 (default: 40)
-    --skip_depth    Skip depth map generation (if already exists)
-    --skip_mask     Skip floor mask generation (if already exists)
-    --skip_configs  Skip config generation (if already exists in configs/)
-    --debug_mask    Save debug overlay for the floor mask
-    --seed          Random seed for config generation
+    --image           Kitchen image path (required)
+    --output_dir      Root output directory (default: pipeline_out/)
+    --n               Number of random configs/videos to generate (default: 10)
+    --config          Path to a single config JSON — skips random generation
+    --mice            Min max mice range (default: 0 3)
+    --cockroaches     Min max cockroach range (default: 0 5)
+    --duration        Video duration range seconds (default: 15 30)
+    --fps             Frames per second (default: 25)
+    --jobs            Parallel render jobs (default: 1)
+    --floor_labels    ADE20K floor label indices (default: 3)
+    --depth_thresh    Depth threshold 0-255 (default: 40)
+    --split           Train/val/test fractions (default: 0.8 0.1 0.1)
+    --every_n         Extract every Nth frame for dataset (default: 1)
+    --no_empty_frames Skip frames with no pest annotations in dataset
+    --skip_depth      Skip depth map generation (if already exists)
+    --skip_mask       Skip floor mask generation (if already exists)
+    --skip_configs    Skip config generation (if already exists in configs/)
+    --skip_extract    Skip frame extraction and dataset assembly
+    --debug_mask      Save debug overlay for the floor mask
+    --seed            Random seed for config generation and dataset split
 """
 
 import argparse
@@ -43,12 +52,21 @@ from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+def _find_extract_script(here):
+    """Support both extract_frames.py and extract_frame.py filenames."""
+    for name in ("extract_frames.py", "extract_frame.py"):
+        path = os.path.join(here, name)
+        if os.path.exists(path):
+            return path
+    return os.path.join(here, "extract_frames.py")   # default (will error clearly)
+
 SCRIPTS = {
     "depth":   os.path.join(HERE, "generate_depth_map.py"),
     "mask":    os.path.join(HERE, "generate_floor_mask.py"),
     "configs": os.path.join(HERE, "generate_configs.py"),
     "render":  os.path.join(HERE, "batch_render.py"),
     "single":  os.path.join(HERE, "add_pests_to_kitchen.py"),
+    "extract": _find_extract_script(HERE),
 }
 
 
@@ -84,6 +102,14 @@ def main():
     parser.add_argument("--skip_configs",  action="store_true")
     parser.add_argument("--debug_mask",    action="store_true")
     parser.add_argument("--seed",          type=int, default=None)
+    parser.add_argument("--split",         type=float, nargs=3, default=[0.8, 0.1, 0.1],
+                        metavar=("TRAIN", "VAL", "TEST"))
+    parser.add_argument("--every_n",       type=int, default=1,
+                        help="Extract every Nth frame for dataset (default: 1)")
+    parser.add_argument("--no_empty_frames", action="store_true",
+                        help="Skip frames with no pest annotations in dataset")
+    parser.add_argument("--skip_extract",  action="store_true",
+                        help="Skip frame extraction and dataset assembly")
     args = parser.parse_args()
 
     # ── Validate image ───────────────────────────────────────────────
@@ -95,10 +121,11 @@ def main():
     out        = args.output_dir
     os.makedirs(out, exist_ok=True)
 
-    depth_path  = os.path.join(out, f"{image_stem}_depth.png")
-    mask_path   = os.path.join(out, f"{image_stem}_mask.png")
-    config_dir  = os.path.join(out, "configs")
-    video_dir   = os.path.join(out, "videos")
+    depth_path   = os.path.join(out, f"{image_stem}_depth.png")
+    mask_path    = os.path.join(out, f"{image_stem}_mask.png")
+    config_dir   = os.path.join(out, "configs")
+    video_dir    = os.path.join(out, "videos")
+    dataset_dir  = os.path.join(out, "dataset")
     os.makedirs(video_dir, exist_ok=True)
 
     print(f"\n[PIPELINE] Image : {args.image}")
@@ -116,14 +143,17 @@ def main():
             depth_path = None
         else:
             run([sys.executable, SCRIPTS["depth"],
-                 "--image", args.image,
+                 "--image",  args.image,
                  "--output", depth_path],
                 "Generate depth map")
+            if not Path(depth_path).exists():
+                print(f"[WARN] Depth map not found at {depth_path}")
+                depth_path = None
 
     # ── Step 2: Floor mask ───────────────────────────────────────────
     if args.skip_mask and os.path.exists(mask_path):
         print(f"\n[SKIP] Floor mask exists: {mask_path}")
-    else:
+    elif not args.skip_mask or not os.path.exists(mask_path):
         mask_cmd = [
             sys.executable, SCRIPTS["mask"],
             "--image",        args.image,
@@ -142,12 +172,13 @@ def main():
         # Single config mode — render just this one
         print(f"\n[INFO] Single config mode: {args.config}")
 
-        # Patch the config to use our computed mask/depth if not already set
+        # Patch the config — always use pipeline-computed mask/depth paths
+        # so relative paths in the original config don't break the render step
         with open(args.config) as f:
             cfg = json.load(f)
-        if "mask" not in cfg and os.path.exists(mask_path):
+        if os.path.exists(mask_path):
             cfg["mask"] = mask_path
-        if "depth" not in cfg and depth_path and os.path.exists(depth_path):
+        if depth_path and os.path.exists(depth_path):
             cfg["depth"] = depth_path
         if "output" not in cfg:
             cfg["output"] = os.path.join(video_dir, "output_0000.mp4")
@@ -160,7 +191,33 @@ def main():
 
         run([sys.executable, SCRIPTS["single"], "--config", patched],
             "Render single video")
-        print(f"\n[DONE] Video: {cfg['output']}")
+
+        # Extract frames from the single video into the dataset dir
+        if args.skip_extract:
+            print(f"\n[SKIP] Frame extraction skipped (--skip_extract)")
+        else:
+            video_out = cfg["output"]
+            extract_cmd = [
+                sys.executable, SCRIPTS["extract"],
+                "--video",      video_out,
+                "--output_dir", dataset_dir,
+                "--split",      str(args.split[0]), str(args.split[1]), str(args.split[2]),
+                "--every_n",    str(args.every_n),
+                "--quality",    "95",
+            ]
+            if args.no_empty_frames:
+                extract_cmd += ["--no_empty"]
+            if args.seed is not None:
+                extract_cmd += ["--seed", str(args.seed)]
+            run(extract_cmd, "Extract frames + build COCO dataset")
+
+        print(f"\n{'═'*60}")
+        print(f"  PIPELINE COMPLETE")
+        print(f"  Video   → {cfg['output']}")
+        if not args.skip_extract:
+            print(f"  Dataset → {dataset_dir}/")
+            print(f"            annotations/train.json  val.json  test.json")
+        print(f"{'═'*60}\n")
         return
 
     # Random config generation
@@ -196,9 +253,30 @@ def main():
         "--jobs",        str(args.jobs),
     ], f"Batch render (jobs={args.jobs})")
 
+    # ── Step 5: Extract frames + build COCO dataset ───────────────────
+    if args.skip_extract:
+        print(f"\n[SKIP] Frame extraction skipped (--skip_extract)")
+    else:
+        extract_cmd = [
+            sys.executable, SCRIPTS["extract"],
+            "--video_dir",  video_dir,
+            "--output_dir", dataset_dir,
+            "--split",      str(args.split[0]), str(args.split[1]), str(args.split[2]),
+            "--every_n",    str(args.every_n),
+            "--quality",    "95",
+        ]
+        if args.no_empty_frames:
+            extract_cmd += ["--no_empty"]
+        if args.seed is not None:
+            extract_cmd += ["--seed", str(args.seed)]
+        run(extract_cmd, "Extract frames + build COCO dataset")
+
     print(f"\n{'═'*60}")
     print(f"  PIPELINE COMPLETE")
-    print(f"  Videos → {video_dir}/")
+    print(f"  Videos  → {video_dir}/")
+    if not args.skip_extract:
+        print(f"  Dataset → {dataset_dir}/")
+        print(f"            annotations/train.json  val.json  test.json")
     print(f"{'═'*60}\n")
 
 

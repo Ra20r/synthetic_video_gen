@@ -1,12 +1,12 @@
 """
 add_pests_to_kitchen.py
 ========================
-Overlays animated pests (mouse, cockroach) on a kitchen image and exports MP4.
-Driven by a JSON config file.
+Overlays animated pests (mouse, cockroach) on a kitchen image and exports:
+  - MP4 video
+  - COCO JSON annotation file (bboxes, instance segmentation masks, track IDs)
 
-Pests move on the floor only — no climbing (removed for stability).
-The path is fully pre-validated: every position is confirmed on the floor
-mask before rendering begins, so pests never appear/disappear.
+The annotation file is written alongside the video automatically.
+Frame extraction and final COCO assembly is handled by extract_frames.py.
 
 Requirements:
     pip install opencv-python numpy
@@ -17,8 +17,8 @@ Usage:
 Config:
     {
       "image":        "kitchen1.png",
-      "mask":         "kitchen1_mask.png",   # floor mask (required for best results)
-      "depth":        "kitchen1_depth.png",  # depth map (optional, for perspective)
+      "mask":         "kitchen1_mask.png",
+      "depth":        "kitchen1_depth.png",
       "output":       "output.mp4",
       "duration":     30,
       "fps":          25,
@@ -38,6 +38,17 @@ import random
 import json
 import sys
 import os
+
+
+# ─────────────────────────────────────────────
+#  CATEGORY DEFINITIONS
+# ─────────────────────────────────────────────
+
+CATEGORIES = [
+    {"id": 1, "name": "mouse",      "supercategory": "pest"},
+    {"id": 2, "name": "cockroach",  "supercategory": "pest"},
+]
+CAT_ID = {"mouse": 1, "cockroach": 2}
 
 
 # ─────────────────────────────────────────────
@@ -165,14 +176,14 @@ def draw_cockroach(base_size, frame_idx, angle_deg, scale=1.0):
     ca, sa = math.cos(ar), math.sin(ar)
     def rot(dx, dy): return int(cx+dx*ca-dy*sa), int(cy+dx*sa+dy*ca)
 
-    leg_phase = frame_idx * 0.6
+    lp = frame_idx * 0.6
     for side in (-1, 1):
-        for lx, ly, phase_off in [(0.1,1.0,0.2),(-0.2,0.9,0.0),(-0.5,0.8,-0.2)]:
-            sway = math.sin(leg_phase+phase_off)*0.25*side
+        for lx, ly, po in [(0.1,1.0,0.2),(-0.2,0.9,0.0),(-0.5,0.8,-0.2)]:
+            sw = math.sin(lp+po)*0.25*side
             p1 = rot(lx*r, side*ly*r)
-            p2 = rot((lx-0.5)*r, side*(ly+0.6+sway)*r)
+            p2 = rot((lx-0.5)*r, side*(ly+0.6+sw)*r)
             la(p1, p2, LEGS, max(1, int(r*0.12)))
-            la(p2, rot((lx-0.8)*r, side*(ly+0.9+sway)*r), LEGS, max(1,int(r*0.09)))
+            la(p2, rot((lx-0.8)*r, side*(ly+0.9+sw)*r), LEGS, max(1,int(r*0.09)))
 
     for t in np.linspace(-0.5, 0.5, 12):
         bx, by = rot(t*r*1.8, 0)
@@ -182,17 +193,13 @@ def draw_cockroach(base_size, frame_idx, angle_deg, scale=1.0):
         fc(bx, by, int(r*0.18*(1-0.5*abs(t/0.35))), STRIPE)
 
     fc(*rot(r*1.1, 0), int(r*0.45), HEAD)
-
     for s in (-1, 1):
         fc(*rot(r*1.25, s*r*0.28), max(1,int(r*0.10)), EYE)
 
-    ant_sway = math.sin(frame_idx*0.3)*r*0.3
+    asw = math.sin(frame_idx*0.3)*r*0.3
     for s in (-1, 1):
-        base = rot(r*1.4, s*r*0.2)
-        mid  = rot(r*2.2, s*(r*0.4+ant_sway*0.5))
-        tip  = rot(r*3.0, s*(r*0.5+ant_sway))
-        la(base, mid, ANTENA, max(1,int(r*0.08)))
-        la(mid, tip,  ANTENA, max(1,int(r*0.06)))
+        la(rot(r*1.4, s*r*0.2), rot(r*2.2, s*(r*0.4+asw*0.5)), ANTENA, max(1,int(r*0.08)))
+        la(rot(r*2.2, s*(r*0.4+asw*0.5)), rot(r*3.0, s*(r*0.5+asw)), ANTENA, max(1,int(r*0.06)))
 
     return img
 
@@ -201,24 +208,112 @@ SPRITE_FNS = {"mouse": draw_mouse, "cockroach": draw_cockroach}
 
 
 # ─────────────────────────────────────────────
+#  ANNOTATION HELPERS
+# ─────────────────────────────────────────────
+
+def sprite_to_bbox_and_mask(sprite_bgra, cx, cy, img_w, img_h):
+    """
+    Given a BGRA sprite centred at (cx, cy) in the scene, return:
+      - bbox  : [x, y, w, h] in image coordinates (COCO format, floats)
+      - mask  : binary H×W uint8 array in image coordinates
+      - area  : float pixel area of the mask
+
+    Uses the sprite's alpha channel as the instance mask — pixel-perfect.
+    """
+    sh, sw = sprite_bgra.shape[:2]
+    alpha  = sprite_bgra[:, :, 3]   # H×W, 0-255
+
+    # Sprite top-left corner in scene coords
+    x0 = cx - sw // 2
+    y0 = cy - sh // 2
+
+    # Clamp to image bounds
+    ix0 = max(0, x0);  iy0 = max(0, y0)
+    ix1 = min(img_w, x0 + sw);  iy1 = min(img_h, y0 + sh)
+
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None, None, 0.0
+
+    # Corresponding slice in the sprite
+    sx0 = ix0 - x0;  sy0 = iy0 - y0
+    sx1 = sx0 + (ix1 - ix0);  sy1 = sy0 + (iy1 - iy0)
+
+    # Build full-image binary mask
+    img_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    sprite_alpha_crop = alpha[sy0:sy1, sx0:sx1]
+    img_mask[iy0:iy1, ix0:ix1] = (sprite_alpha_crop > 64).astype(np.uint8)
+
+    area = float(img_mask.sum())
+    if area == 0:
+        return None, None, 0.0
+
+    # Tight bbox from mask
+    rows = np.any(img_mask, axis=1)
+    cols = np.any(img_mask, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+
+    bx = float(cmin)
+    by = float(rmin)
+    bw = float(cmax - cmin + 1)
+    bh = float(rmax - rmin + 1)
+
+    return [bx, by, bw, bh], img_mask, area
+
+
+def mask_to_rle(binary_mask):
+    """
+    Encode a binary mask as COCO RLE (run-length encoding).
+    Returns {"counts": [...], "size": [H, W]}.
+    Column-major (Fortran order) as per COCO spec.
+    """
+    h, w = binary_mask.shape
+    flat = binary_mask.flatten(order="F").tolist()
+    counts = []
+    current = 0
+    count = 0
+    for px in flat:
+        if px == current:
+            count += 1
+        else:
+            counts.append(count)
+            count = 1
+            current = px
+    counts.append(count)
+    # COCO RLE must start with a run of 0s
+    if flat[0] != 0:
+        counts = [0] + counts
+    return {"counts": counts, "size": [h, w]}
+
+
+def mask_to_polygon(binary_mask):
+    """
+    Convert binary mask to COCO polygon segmentation.
+    Returns list of [x1,y1,x2,y2,...] polygons, or None if no contour found.
+    Polygons with fewer than 6 points are dropped.
+    """
+    contours, _ = cv2.findContours(
+        binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    polys = []
+    for c in contours:
+        c = c.squeeze()
+        if c.ndim != 2 or len(c) < 3:
+            continue
+        flat = c.flatten().tolist()
+        if len(flat) >= 6:
+            polys.append(flat)
+    return polys if polys else None
+
+
+# ─────────────────────────────────────────────
 #  PATH GENERATION
-#  Fully pre-validated: every position is
-#  checked against the floor mask before the
-#  list is returned — no mid-render surprises.
 # ─────────────────────────────────────────────
 
 def generate_path(width, height, n_frames, speed,
                   floor_mask=None, margin=30, seed=None):
-    """
-    Generate a smooth, continuous scurry path.
-    Every position is validated on the floor mask.
-    The pest is NEVER teleported — if it gets stuck it steers
-    back toward the nearest valid floor pixel.
-    """
     if seed is not None:
         random.seed(seed)
 
-    # Pre-compute list of all valid floor pixels for fast lookup
     if floor_mask is not None:
         valid_ys, valid_xs = np.where(floor_mask)
         if len(valid_xs) == 0:
@@ -226,25 +321,20 @@ def generate_path(width, height, n_frames, speed,
         valid_set = set(zip(valid_xs.tolist(), valid_ys.tolist()))
 
         def is_valid(x, y):
-            xi = int(np.clip(round(x), 0, width-1))
-            yi = int(np.clip(round(y), 0, height-1))
-            return (xi, yi) in valid_set
+            return (int(np.clip(round(x), 0, width-1)),
+                    int(np.clip(round(y), 0, height-1))) in valid_set
 
-        def nearest_valid(x, y, search_r=60):
-            """Find nearest valid pixel within search_r — used as last resort."""
-            xi = int(np.clip(round(x), 0, width-1))
-            yi = int(np.clip(round(y), 0, height-1))
-            dists = (valid_xs - xi)**2 + (valid_ys - yi)**2
+        def nearest_valid(x, y):
+            dists = (valid_xs - int(round(x)))**2 + (valid_ys - int(round(y)))**2
             idx   = np.argmin(dists)
             return float(valid_xs[idx]), float(valid_ys[idx])
 
-        # Start at a random valid floor pixel
         idx = random.randint(0, len(valid_xs)-1)
         x, y = float(valid_xs[idx]), float(valid_ys[idx])
     else:
         def is_valid(x, y):
             return margin <= x <= width-margin and margin <= y <= height-margin
-        def nearest_valid(x, y, search_r=60):
+        def nearest_valid(x, y):
             return float(np.clip(x, margin, width-margin)), \
                    float(np.clip(y, margin, height-margin))
         x = float(random.randint(margin, width-margin))
@@ -256,31 +346,27 @@ def generate_path(width, height, n_frames, speed,
     target_speed  = speed
     pause_timer   = 0
     steer_timer   = 0
-    stuck_counter = 0          # consecutive frames where escape failed
+    stuck_counter = 0
     positions     = []
 
-    for frame in range(n_frames):
-        # Always record current (validated) position
+    for _ in range(n_frames):
         positions.append((x, y))
 
         if pause_timer > 0:
             pause_timer -= 1
             continue
 
-        # Choose new wander target periodically
         if steer_timer <= 0:
             target_angle = random.uniform(0, 2*math.pi)
             target_speed = speed * random.uniform(0.5, 1.5)
             steer_timer  = random.randint(20, 60)
         steer_timer -= 1
 
-        # Smooth angle interpolation
         max_turn = math.radians(8)
         diff = (target_angle - current_angle + math.pi) % (2*math.pi) - math.pi
         current_angle += max(-max_turn, min(max_turn, diff))
         current_speed += (target_speed - current_speed) * 0.08
 
-        # Sniff pause
         if random.random() < 0.008:
             pause_timer  = random.randint(12, 35)
             target_speed = speed * 1.4
@@ -290,49 +376,37 @@ def generate_path(width, height, n_frames, speed,
         vy = math.sin(current_angle) * current_speed
         nx, ny = x + vx, y + vy
 
-        # Hard screen-edge bounce
         if nx < margin or nx > width - margin:
-            vx *= -1
-            nx = float(np.clip(nx, margin, width-margin))
-            current_angle = math.atan2(vy, vx)
-            target_angle  = current_angle
+            vx *= -1; nx = float(np.clip(nx, margin, width-margin))
+            current_angle = math.atan2(vy, vx); target_angle = current_angle
         if ny < margin or ny > height - margin:
-            vy *= -1
-            ny = float(np.clip(ny, margin, height-margin))
-            current_angle = math.atan2(vy, vx)
-            target_angle  = current_angle
+            vy *= -1; ny = float(np.clip(ny, margin, height-margin))
+            current_angle = math.atan2(vy, vx); target_angle = current_angle
 
         if is_valid(nx, ny):
             x, y = nx, ny
             stuck_counter = 0
         else:
-            # Try progressively wider escape angles
             escaped = False
             for attempt in range(32):
-                spread    = 0.3 + attempt * 0.18
-                test_a    = current_angle + math.pi + random.uniform(-spread, spread)
-                tnx = float(np.clip(x + math.cos(test_a)*current_speed, margin, width-margin))
-                tny = float(np.clip(y + math.sin(test_a)*current_speed, margin, height-margin))
+                spread = 0.3 + attempt * 0.18
+                ta     = current_angle + math.pi + random.uniform(-spread, spread)
+                tnx    = float(np.clip(x + math.cos(ta)*current_speed, margin, width-margin))
+                tny    = float(np.clip(y + math.sin(ta)*current_speed, margin, height-margin))
                 if is_valid(tnx, tny):
                     x, y = tnx, tny
-                    current_angle = test_a
-                    target_angle  = test_a + random.uniform(-0.4, 0.4)
+                    current_angle = ta
+                    target_angle  = ta + random.uniform(-0.4, 0.4)
                     escaped = True
                     stuck_counter = 0
                     break
-
             if not escaped:
                 stuck_counter += 1
                 if stuck_counter >= 10:
-                    # Genuinely stuck — snap to nearest valid pixel
-                    # This is the only teleport, but it's silent (no skip frame)
-                    # so the pest doesn't disappear — it just moves to safety
-                    nx, ny = nearest_valid(x, y)
-                    x, y = nx, ny
+                    x, y = nearest_valid(x, y)
                     current_angle = random.uniform(0, 2*math.pi)
                     target_angle  = current_angle
                     stuck_counter = 0
-                # else: stay in place this frame (already recorded)
 
     return positions
 
@@ -379,8 +453,11 @@ class PestAgent:
                  floor_mask, depth_map, agent_idx):
         ptype = pest_cfg.get("type", "mouse").lower()
         if ptype not in SPRITE_FNS:
-            raise ValueError(f"Unknown pest type '{ptype}'. Options: {list(SPRITE_FNS)}")
+            raise ValueError(f"Unknown pest type: {ptype}")
 
+        self.ptype     = ptype
+        self.cat_id    = CAT_ID[ptype]
+        self.track_id  = agent_idx + 1          # 1-indexed, stable across all frames
         self.draw_fn   = SPRITE_FNS[ptype]
         self.base_size = int(pest_cfg.get("size", 50))
         self.speed     = float(pest_cfg.get("speed", 6))
@@ -391,10 +468,13 @@ class PestAgent:
                                   floor_mask=floor_mask, seed=seed)
         self.prev_angle = 0.0
 
-    def render_onto(self, frame, frame_idx, img_h, img_w):
+    def get_sprite_and_meta(self, frame_idx, img_h, img_w):
+        """
+        Returns (sprite_bgra, cx, cy, persp_scale) for this frame.
+        Separated from render_onto so annotations can reuse the same sprite.
+        """
         px, py = self.path[frame_idx]
 
-        # Facing angle — smoothed over 3 frames
         if frame_idx >= 3:
             dx = self.path[frame_idx][0] - self.path[frame_idx-3][0]
             dy = self.path[frame_idx][1] - self.path[frame_idx-3][1]
@@ -402,17 +482,20 @@ class PestAgent:
                 self.prev_angle = math.degrees(math.atan2(dy, dx))
         angle = self.prev_angle
 
-        # Perspective scale from depth
         if self.depth_map is not None:
             d = depth_at(self.depth_map, int(px), int(py))
         else:
             d = py / img_h
         persp_scale = float(np.clip(0.35 + 0.65 * d, 0.15, 1.0))
 
-        actual_size = max(8, int(self.base_size * persp_scale))
-        frame = add_contact_shadow(frame, int(px), int(py), actual_size)
         sprite = self.draw_fn(self.base_size, frame_idx, angle, scale=persp_scale)
-        frame  = overlay_sprite(frame, sprite, int(px), int(py))
+        return sprite, int(px), int(py), persp_scale
+
+    def render_onto(self, frame, frame_idx, img_h, img_w):
+        sprite, cx, cy, scale = self.get_sprite_and_meta(frame_idx, img_h, img_w)
+        actual_size = max(8, int(self.base_size * scale))
+        frame = add_contact_shadow(frame, cx, cy, actual_size)
+        frame = overlay_sprite(frame, sprite, cx, cy)
         return frame
 
 
@@ -422,13 +505,12 @@ class PestAgent:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Add pests to a kitchen image using a JSON config.")
+        description="Add pests to a kitchen image and export video + COCO annotations.")
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
 
     if not os.path.exists(args.config):
-        print(f"[ERROR] Config not found: {args.config}")
-        sys.exit(1)
+        print(f"[ERROR] Config not found: {args.config}"); sys.exit(1)
 
     with open(args.config) as f:
         cfg = json.load(f)
@@ -464,11 +546,9 @@ def main():
         n_floor = int(floor_mask.sum())
         print(f"[INFO] Walkable px: {n_floor} ({100*n_floor/(h*w):.1f}%)")
         if n_floor == 0:
-            print("[ERROR] Floor mask is empty — run generate_floor_mask.py first")
-            sys.exit(1)
+            print("[ERROR] Floor mask is empty."); sys.exit(1)
     elif depth_map is not None:
         floor_mask = depth_map > floor_thresh
-        print(f"[INFO] Floor from depth: {int(floor_mask.sum())} px")
     else:
         print("[INFO] No mask/depth — full image is walkable")
 
@@ -479,29 +559,118 @@ def main():
         count = int(pest_cfg.get("count", 1))
         ptype = pest_cfg.get("type", "mouse")
         print(f"[INFO] Generating paths for {count}× {ptype}…")
-        for i in range(count):
+        for _ in range(count):
             agents.append(PestAgent(pest_cfg, w, h, n_frames,
-                                    floor_mask, depth_map,
-                                    len(agents)))
+                                    floor_mask, depth_map, len(agents)))
 
     print(f"[INFO] Total pests: {len(agents)}")
 
+    # ── COCO skeleton ────────────────────────────────────────────────
+    # "images" and "annotations" are populated per-frame during render.
+    # "frame_meta" is a per-frame record used by extract_frames.py.
+    coco = {
+        "info": {
+            "description": "Synthetic pest video annotations",
+            "version": "1.0",
+            "source_image": os.path.basename(image_path),
+            "video": os.path.basename(output_path),
+            "fps": fps,
+            "duration": duration,
+            "width": w,
+            "height": h,
+        },
+        "categories": CATEGORIES,
+        "images":      [],   # one entry per frame
+        "annotations": [],   # one entry per pest per frame
+        "frame_meta":  [],   # classifier label + frame-level info
+    }
+
+    ann_id     = 1
+    video_stem = os.path.splitext(os.path.basename(output_path))[0]
+
+    # ── Video writer ─────────────────────────────────────────────────
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
     if not writer.isOpened():
         raise RuntimeError("Could not open VideoWriter.")
 
     print(f"[INFO] Rendering {n_frames} frames → {output_path}")
+
     for i in range(n_frames):
         frame = bg.copy()
+
+        # Collect annotations for this frame
+        frame_anns   = []
+        has_pest     = False
+
         for agent in agents:
-            frame = agent.render_onto(frame, i, h, w)
+            sprite, cx, cy, scale = agent.get_sprite_and_meta(i, h, w)
+
+            # Draw
+            actual_size = max(8, int(agent.base_size * scale))
+            frame = add_contact_shadow(frame, cx, cy, actual_size)
+            frame = overlay_sprite(frame, sprite, cx, cy)
+
+            # Annotation geometry from sprite alpha
+            bbox, mask_arr, area = sprite_to_bbox_and_mask(sprite, cx, cy, w, h)
+            if bbox is None:
+                continue
+
+            has_pest = True
+            polys    = mask_to_polygon(mask_arr)
+            seg      = polys if polys else mask_to_rle(mask_arr)
+
+            frame_anns.append({
+                "id":            ann_id,
+                "image_id":      i,          # frame index as image_id
+                "category_id":   agent.cat_id,
+                "bbox":          [round(v, 2) for v in bbox],
+                "area":          round(area, 2),
+                "segmentation":  seg,
+                "iscrowd":       0,
+                "track_id":      agent.track_id,   # stable across frames
+            })
+            ann_id += 1
+
+        # Image record — filename matches what extract_frames.py will write
+        frame_filename = f"{video_stem}_frame_{i:06d}.jpg"
+        coco["images"].append({
+            "id":        i,
+            "file_name": frame_filename,
+            "width":     w,
+            "height":    h,
+            "frame_idx": i,
+            "timestamp": round(i / fps, 4),
+            "video":     os.path.basename(output_path),
+        })
+
+        coco["annotations"].extend(frame_anns)
+
+        # Frame-level classifier record
+        coco["frame_meta"].append({
+            "frame_idx":   i,
+            "has_pest":    has_pest,
+            "pest_count":  len(frame_anns),
+            "file_name":   frame_filename,
+        })
+
         writer.write(frame)
         if i % fps == 0:
             print(f"  frame {i:4d}/{n_frames}", end="\r")
 
     writer.release()
-    print(f"\n[DONE] Saved to: {output_path}")
+
+    # ── Save COCO JSON ───────────────────────────────────────────────
+    ann_path = os.path.splitext(output_path)[0] + "_coco.json"
+    with open(ann_path, "w") as f:
+        json.dump(coco, f)    # compact — can be pretty-printed if needed
+
+    total_anns  = len(coco["annotations"])
+    pest_frames = sum(1 for fm in coco["frame_meta"] if fm["has_pest"])
+    print(f"\n[DONE] Video   : {output_path}")
+    print(f"[DONE] COCO    : {ann_path}")
+    print(f"       frames  : {n_frames}  |  pest frames : {pest_frames}")
+    print(f"       annotations: {total_anns}  |  pests: {len(agents)}")
 
 
 if __name__ == "__main__":

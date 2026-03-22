@@ -1,7 +1,5 @@
 {
   "image":    "kitchen1.png",
-  "mask":     "kitchen1_mask.png",
-  "depth":    "kitchen1_depth.png",
   "output":   "output.mp4",
   "duration": 30,
   "fps":      25,
