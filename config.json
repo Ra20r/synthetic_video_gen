@@ -1,10 +1,15 @@
 {
   "image":    "kitchen2.png",
-  "output":   "output.mp4",
-  "duration": 30,
-  "fps":      25,
+  "surfaces": [
+    {"name": "floor",   "mask": "out/kitchen2/kitchen2_floor.png"}
+  ],
+  "depth":  "out/kitchen2/kitchen2_depth.png",
+  "light":  "out/kitchen2/kitchen2_light.json",
+  "grain":  0,
+  "output": "output.mp4",
+  "duration": 30, "fps": 25,
   "pests": [
     {"type": "mouse",     "count": 1, "size": 50, "speed": 6},
-    {"type": "cockroach", "count": 1, "size": 30, "speed": 9}
+    {"type": "cockroach", "count": 2, "size": 30, "speed": 9}
   ]
 }

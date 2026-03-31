@@ -41,105 +41,33 @@ import cv2
 import numpy as np
 
 
-# ── Inline the core rendering logic so benchmark is self-contained ────────────
-# (Mirrors add_pests_to_kitchen.py — keep in sync if sprites change)
+# ── Import rendering functions directly from add_pests_to_kitchen.py ──────────
+# This ensures the benchmark always reflects actual render cost.
 
-def _draw_mouse(base_size, frame_idx, angle_deg, scale=1.0):
-    c = max(16, int(base_size * scale))
-    img = np.zeros((c, c, 4), dtype=np.uint8)
-    cx, cy = c // 2, c // 2
-    r = int(c * 0.22)
-    if r < 2: return img
-    FUR=(80,80,100,255); BELLY=(130,130,160,255); EAR=(100,60,120,255)
-    PINK=(140,90,200,255); EYE=(10,10,10,255); NOSE=(100,80,200,255); TAIL=(90,70,110,255)
-    def fc(fx,fy,rad,col):
-        if rad<1: return
-        cv2.circle(img,(int(fx),int(fy)),int(rad),col[:3],-1,cv2.LINE_AA)
-        m=np.zeros(img.shape[:2],dtype=np.uint8)
-        cv2.circle(m,(int(fx),int(fy)),int(rad),255,-1,cv2.LINE_AA)
-        img[:,:,3]=np.where(m>0,col[3],img[:,:,3])
-    def la(p1,p2,col,t): cv2.line(img,p1,p2,col[:3],max(1,t),cv2.LINE_AA)
-    ar=math.radians(angle_deg); ca,sa=math.cos(ar),math.sin(ar)
-    def rot(dx,dy): return int(cx+dx*ca-dy*sa),int(cy+dx*sa+dy*ca)
-    sway=math.sin(frame_idx*0.25)*r*0.8
-    tp=[rot(-r*1.1-(i/12)*r*2.0,sway*(i/12)**2) for i in range(13)]
-    for i in range(12): la(tp[i],tp[i+1],TAIL,max(1,int((1-i/12)*r*0.18)))
-    for t in np.linspace(-0.45,0.45,10):
-        bx,by=rot(t*r*1.6,0); fc(bx,by,int(r*(1.0-0.3*abs(t/0.45))),FUR)
-    for t in np.linspace(-0.2,0.2,5):
-        bx,by=rot(t*r*0.9,0); fc(bx,by,int(r*0.45*(1-0.4*abs(t/0.2))),BELLY)
-    for s in (-1,1):
-        ex,ey=rot(r*0.55,s*r*0.85); fc(ex,ey,int(r*0.38),EAR); fc(ex,ey,int(r*0.22),PINK)
-    fc(*rot(r*0.95,0),int(r*0.68),FUR)
-    for s in (-1,1):
-        ex,ey=rot(r*1.05,s*r*0.32); fc(ex,ey,int(r*0.13),EYE)
-        fc(ex-1,ey-1,max(1,int(r*0.05)),(255,255,255,255))
-    fc(*rot(r*1.55,0),int(r*0.12),NOSE)
-    wig=math.sin(frame_idx*0.5)*3
-    for lx,ly,w_ in [(0.3,0.9,wig),(0.3,-0.9,-wig),(-0.3,0.9,-wig),(-0.3,-0.9,wig)]:
-        la(rot(lx*r,ly*r),rot(lx*r,(ly+w_*0.1)*r*1.45),FUR,max(1,int(r*0.18)))
-    return img
+def _load_renderer():
+    """Load rendering functions from add_pests_to_kitchen.py."""
+    import importlib.util, os
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "add_pests_to_kitchen.py")
+    if not os.path.exists(script):
+        # Fallback: look alongside benchmark.py
+        script = os.path.join(os.path.dirname(__file__), "add_pests_to_kitchen.py")
+    spec = importlib.util.spec_from_file_location("apt", script)
+    m    = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
 
-def _draw_cockroach(base_size, frame_idx, angle_deg, scale=1.0):
-    c = max(16, int(base_size * scale))
-    img = np.zeros((c, c, 4), dtype=np.uint8)
-    cx, cy = c // 2, c // 2
-    r = int(c * 0.20)
-    if r < 2: return img
-    SHELL=(20,45,60,255); LEGS=(15,35,50,255); HEAD=(10,30,45,255)
-    STRIPE=(30,60,80,255); EYE=(200,220,255,255); ANT=(10,30,45,255)
-    def fc(fx,fy,rad,col):
-        if rad<1: return
-        cv2.circle(img,(int(fx),int(fy)),int(rad),col[:3],-1,cv2.LINE_AA)
-        m=np.zeros(img.shape[:2],dtype=np.uint8)
-        cv2.circle(m,(int(fx),int(fy)),int(rad),255,-1,cv2.LINE_AA)
-        img[:,:,3]=np.where(m>0,col[3],img[:,:,3])
-    def la(p1,p2,col,t): cv2.line(img,p1,p2,col[:3],max(1,t),cv2.LINE_AA)
-    ar=math.radians(angle_deg); ca,sa=math.cos(ar),math.sin(ar)
-    def rot(dx,dy): return int(cx+dx*ca-dy*sa),int(cy+dx*sa+dy*ca)
-    lp=frame_idx*0.6
-    for side in (-1,1):
-        for lx,ly,po in [(0.1,1.0,0.2),(-0.2,0.9,0.0),(-0.5,0.8,-0.2)]:
-            sw=math.sin(lp+po)*0.25*side
-            p1=rot(lx*r,side*ly*r); p2=rot((lx-0.5)*r,side*(ly+0.6+sw)*r)
-            la(p1,p2,LEGS,max(1,int(r*0.12))); la(p2,rot((lx-0.8)*r,side*(ly+0.9+sw)*r),LEGS,max(1,int(r*0.09)))
-    for t in np.linspace(-0.5,0.5,12):
-        bx,by=rot(t*r*1.8,0); fc(bx,by,int(r*(1.0-0.35*abs(t/0.5))),SHELL)
-    for t in np.linspace(-0.35,0.35,5):
-        bx,by=rot(t*r*1.4,0); fc(bx,by,int(r*0.18*(1-0.5*abs(t/0.35))),STRIPE)
-    fc(*rot(r*1.1,0),int(r*0.45),HEAD)
-    for s in (-1,1): fc(*rot(r*1.25,s*r*0.28),max(1,int(r*0.10)),EYE)
-    asw=math.sin(frame_idx*0.3)*r*0.3
-    for s in (-1,1):
-        la(rot(r*1.4,s*r*0.2),rot(r*2.2,s*(r*0.4+asw*0.5)),ANT,max(1,int(r*0.08)))
-        la(rot(r*2.2,s*(r*0.4+asw*0.5)),rot(r*3.0,s*(r*0.5+asw)),ANT,max(1,int(r*0.06)))
-    return img
+_R = _load_renderer()
+_draw_mouse      = _R.draw_mouse
+_draw_cockroach  = _R.draw_cockroach
+_overlay         = _R.overlay_sprite
+_shadow          = _R.add_shadow
+_grain           = _R.add_film_grain
+_motion_blur     = _R.apply_motion_blur
+_colour_tint     = _R.apply_colour_tint
+_default_light   = _R.default_light_params
+_sample_colour   = _R.sample_surface_colour
 
-def _overlay(bg, sprite, cx, cy):
-    h,w=sprite.shape[:2]; bh,bw=bg.shape[:2]
-    x0,y0=cx-w//2,cy-h//2; x1,y1=x0+w,y0+h
-    sx0=max(0,-x0); sy0=max(0,-y0)
-    sx1=w-max(0,x1-bw); sy1=h-max(0,y1-bh)
-    bx0=max(0,x0); by0=max(0,y0)
-    bx1=bx0+(sx1-sx0); by1=by0+(sy1-sy0)
-    if bx1<=bx0 or by1<=by0: return bg
-    roi=bg[by0:by1,bx0:bx1].astype(np.float32)
-    sp=sprite[sy0:sy1,sx0:sx1]
-    a=sp[:,:,3:4].astype(np.float32)/255.0
-    bg[by0:by1,bx0:bx1]=np.clip(roi*(1-a)+sp[:,:,:3].astype(np.float32)*a,0,255).astype(np.uint8)
-    return bg
-
-def _shadow(frame, cx, cy, size):
-    r=max(2,int(size*0.18)); hr=max(1,int(r*0.35))
-    ov=frame.copy()
-    cv2.ellipse(ov,(int(cx),int(cy)+int(size*0.08)),(r,hr),0,0,360,(10,10,10),-1,cv2.LINE_AA)
-    cv2.addWeighted(ov,0.28,frame,0.72,0,frame)
-    return frame
-
-
-# ─────────────────────────────────────────────
-#  SYSTEM INFO
-# ─────────────────────────────────────────────
 
 def get_system_info():
     info = {
@@ -150,7 +78,6 @@ def get_system_info():
         "cv2":      cv2.__version__,
         "numpy":    np.__version__,
     }
-    # RAM
     try:
         import psutil
         info["ram_gb"] = round(psutil.virtual_memory().total / 1e9, 1)
@@ -164,6 +91,14 @@ def print_system_info(info):
     for k, v in info.items():
         print(f"│  {k:<12} {v}")
     print("└───────────────────────────────────────────────────────")
+
+
+def format_time(seconds):
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m = int(seconds // 60)
+    s = seconds % 60
+    return f"{m}m {s:.0f}s"
 
 
 # ─────────────────────────────────────────────
@@ -225,14 +160,15 @@ def make_dummy_path(n_frames, width, height, floor_mask=None, margin=30):
     return path
 
 
-def run_scenario(bg, floor_mask, depth_map, scenario, n_frames, fps, save_path=None):
-    """
-    Time a single scenario. Returns dict with timing breakdown.
-    """
-    h, w = bg.shape[:2]
-    pests = scenario["pests"]  # list of (type, count, size)
+def run_scenario(bg, floor_mask, depth_map, scenario, n_frames, fps,
+                 grain=0.02, save_path=None):
+    """Time a single scenario. Includes all realism features."""
+    import math
+    h, w   = bg.shape[:2]
+    pests  = scenario["pests"]
+    light  = _default_light()
+    scolour = _sample_colour(bg, floor_mask) if floor_mask is not None else None
 
-    # ── Time: path generation ─────────────────────────────────────────
     t0 = time.perf_counter()
     all_paths = []
     for ptype, count, size in pests:
@@ -240,71 +176,74 @@ def run_scenario(bg, floor_mask, depth_map, scenario, n_frames, fps, save_path=N
             all_paths.append((ptype, size, make_dummy_path(n_frames, w, h, floor_mask)))
     path_time = time.perf_counter() - t0
 
-    # ── Time: frame rendering ─────────────────────────────────────────
     writer = None
     if save_path:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(save_path, fourcc, fps, (w, h))
 
-    sprite_times  = []
-    overlay_times = []
-    shadow_times  = []
-    write_times   = []
+    t_sprite = t_tint = t_blur = t_shadow = t_overlay = t_grain = t_write = 0.0
 
     for i in range(n_frames):
         frame = bg.copy()
         for ptype, size, path in all_paths:
             px, py = path[i]
-            d = float(depth_map[int(np.clip(py,0,h-1)), int(np.clip(px,0,w-1))]) \
-                if depth_map is not None else py/h
-            scale = float(np.clip(0.35 + 0.65*d, 0.15, 1.0))
-            actual = max(8, int(size*scale))
+            d      = float(depth_map[int(np.clip(py,0,h-1)), int(np.clip(px,0,w-1))])                      if depth_map is not None else py/h
+            scale  = float(np.clip(0.35 + 0.65*d, 0.15, 1.0))
+            fdx    = path[i][0] - path[max(0,i-1)][0]
+            fdy    = path[i][1] - path[max(0,i-1)][1]
+            speed  = math.sqrt(fdx**2 + fdy**2)
 
             t = time.perf_counter()
-            _shadow(frame, int(px), int(py), actual)
-            shadow_times.append(time.perf_counter()-t)
+            sprite = (_draw_mouse if ptype=="mouse" else _draw_cockroach)(size, i, 45.0, scale=scale)
+            t_sprite += time.perf_counter() - t
 
             t = time.perf_counter()
-            sprite = DRAW_FNS[ptype](size, i, 45.0, scale=scale)
-            sprite_times.append(time.perf_counter()-t)
+            sprite = _colour_tint(sprite, scolour, 0.25)
+            t_tint += time.perf_counter() - t
+
+            t = time.perf_counter()
+            sprite = _motion_blur(sprite, fdx, fdy, speed, fps, size*scale)
+            t_blur += time.perf_counter() - t
+
+            t = time.perf_counter()
+            frame = _shadow(frame, int(px), int(py), max(8, int(size*scale)), d, light)
+            t_shadow += time.perf_counter() - t
 
             t = time.perf_counter()
             frame = _overlay(frame, sprite, int(px), int(py))
-            overlay_times.append(time.perf_counter()-t)
+            t_overlay += time.perf_counter() - t
+
+        t = time.perf_counter()
+        frame = _grain(frame, grain)
+        t_grain += time.perf_counter() - t
 
         if writer:
             t = time.perf_counter()
             writer.write(frame)
-            write_times.append(time.perf_counter()-t)
+            t_write += time.perf_counter() - t
 
     if writer:
         writer.release()
 
-    total_render = sum(sprite_times) + sum(overlay_times) + sum(shadow_times)
-    total_write  = sum(write_times)
-    total        = path_time + total_render + total_write
+    total_render = t_sprite + t_tint + t_blur + t_shadow + t_overlay + t_grain
+    total        = path_time + total_render + t_write
 
     return {
-        "n_frames":        n_frames,
-        "n_pests":         sum(c for _,c,_ in pests),
-        "path_gen_s":      path_time,
-        "sprite_draw_s":   sum(sprite_times),
-        "overlay_s":       sum(overlay_times),
-        "shadow_s":        sum(shadow_times),
-        "encode_write_s":  total_write if write_times else 0.0,
-        "total_render_s":  total_render + total_write,
-        "total_s":         total,
-        "fps_achieved":    n_frames / max(total, 0.001),
-        "ms_per_frame":    (total_render + total_write) / max(n_frames, 1) * 1000,
+        "n_frames":       n_frames,
+        "n_pests":        sum(c for _,c,_ in pests),
+        "path_gen_s":     path_time,
+        "sprite_draw_s":  t_sprite,
+        "colour_tint_s":  t_tint,
+        "motion_blur_s":  t_blur,
+        "shadow_s":       t_shadow,
+        "overlay_s":      t_overlay,
+        "film_grain_s":   t_grain,
+        "encode_write_s": t_write,
+        "total_render_s": total_render + t_write,
+        "total_s":        total,
+        "fps_achieved":   n_frames / max(total, 0.001),
+        "ms_per_frame":   (total_render + t_write) / max(n_frames, 1) * 1000,
     }
-
-
-def format_time(seconds):
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    m = int(seconds // 60)
-    s = seconds % 60
-    return f"{m}m {s:.0f}s"
 
 
 def print_scenario_result(name, results):
@@ -318,8 +257,11 @@ def print_scenario_result(name, results):
     print(f"  ┌─ Timing breakdown (avg over {len(results)} run(s)) ─────────────")
     print(f"  │  Path generation   {avg['path_gen_s']*1000:8.1f} ms")
     print(f"  │  Sprite drawing    {avg['sprite_draw_s']*1000:8.1f} ms")
-    print(f"  │  Alpha overlay     {avg['overlay_s']*1000:8.1f} ms")
+    print(f"  │  Colour tint       {avg.get('colour_tint_s',0)*1000:8.1f} ms")
+    print(f"  │  Motion blur       {avg.get('motion_blur_s',0)*1000:8.1f} ms")
     print(f"  │  Shadow            {avg['shadow_s']*1000:8.1f} ms")
+    print(f"  │  Alpha overlay     {avg['overlay_s']*1000:8.1f} ms")
+    print(f"  │  Film grain        {avg.get('film_grain_s',0)*1000:8.1f} ms")
     print(f"  │  Video encode/write{avg['encode_write_s']*1000:8.1f} ms")
     print(f"  │  ─────────────────────────────────────")
     print(f"  │  Total             {avg['total_s']*1000:8.1f} ms  ({format_time(avg['total_s'])} per video)")
@@ -457,6 +399,7 @@ def main():
             t_start = time.perf_counter()
             result  = run_scenario(bg, floor_mask, depth_map, scenario,
                                    n_frames, args.fps,
+                                   grain=0.02,
                                    save_path=save_path if run_i == 0 else None)
             print(f"{time.perf_counter()-t_start:.2f}s")
             run_results.append(result)

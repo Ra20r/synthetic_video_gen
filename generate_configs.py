@@ -83,6 +83,12 @@ def main():
     parser.add_argument("--output_prefix", default="output",
                         help="Prefix for generated video filenames (default: output)")
     parser.add_argument("--seed",          type=int, default=None)
+    parser.add_argument("--surfaces_json", default=None,
+                        help="JSON string of surfaces list [{name, mask}, ...]")
+    parser.add_argument("--light",         default=None,
+                        help="Light params JSON path")
+    parser.add_argument("--grain",         type=float, default=0.02,
+                        help="Film grain strength 0-1 (default: 0.02)")
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -127,12 +133,18 @@ def main():
             "output":   video_name,
             "duration": duration,
             "fps":      args.fps,
+            "grain":    args.grain,
             "pests":    pests,
         }
-        if args.mask:
-            cfg["mask"]  = args.mask
+        if args.surfaces_json:
+            import json as _j
+            cfg["surfaces"] = _j.loads(args.surfaces_json)
+        elif args.mask:
+            cfg["mask"] = args.mask
         if args.depth:
             cfg["depth"] = args.depth
+        if args.light:
+            cfg["light"] = args.light
 
         cfg_path = os.path.join(args.output_dir, f"config_{i:04d}.json")
         with open(cfg_path, "w") as f:
